@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Artur Andrzejczak <andrzejczak.artur@gmail.com>
+# Control check for the OV5647 driver. Run ON the board, after installing.
+#
+#   sudo tests/control-check.sh
+#
+# capture-check.sh proves frames arrive with the right geometry and some
+# content. It says nothing about whether exposure, gain and frame rate
+# reach the sensor, which is a separate way for a camera driver to be
+# broken: streaming looks perfect while every control is ignored.
+#
+# Two rules decide how this script measures:
+#
+#   - Sweeps set controls WHILE streaming, as applications do. A separate
+#     check sets exposure before streamon, which the driver has to carry
+#     into the stream itself: tegracam only does it while the VI
+#     override_enable control is on, and that defaults to off.
+#   - Frame rate is measured inside ONE stream, counting frames in a
+#     time window. Every stream start rewrites the nominal frame length,
+#     so timing separate short streams always reports the mode default.
+set -uo pipefail
+
+DEV=${DEV:-/dev/video0}
+MODE=${MODE:-2}
+W=${W:-1296}
+H=${H:-972}
+# A 64-byte aligned line, see the README.
+BPL=$(( (W * 2 + 63) / 64 * 64 ))
+
+command -v v4l2-ctl >/dev/null || { echo "need v4l2-utils"; exit 2; }
+command -v python3 >/dev/null || { echo "need python3"; exit 2; }
+[ -e "$DEV" ] || { echo "no $DEV: is the driver loaded and the overlay applied?"; exit 2; }
+
+TMP=$(mktemp -d)
+trap 'pkill -9 v4l2-ctl 2>/dev/null; rm -rf "$TMP"' EXIT
+fail=0
+
+# Nothing here works while another process still has the device open, and
+# the usual culprit is an orphaned capture: a kill that hit a `timeout`
+# wrapper and left v4l2-ctl running, or an unprivileged pkill against a stream
+# that was started under sudo, which fails silently.
+pkill -9 v4l2-ctl 2>/dev/null
+systemctl stop nvargus-daemon 2>/dev/null
+sleep 2
+held=$(fuser "$DEV" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')
+if [ -n "$held" ]; then
+	echo "$DEV is still held by pid(s) $held after cleanup:"
+	ps -o pid=,user=,args= -p $held 2>/dev/null | sed 's/^/  /'
+	echo "run this script as root, or kill those first"
+	exit 2
+fi
+
+# Argus leaves the VI controls bypass_mode and override_enable at 1, and the
+# raw path returns nothing until both are back at 0. The sensor still
+# streams, but the VI channel does not hand frames over. Where resetting
+# does not help, rebinding the sensor driver rebuilds the channel, no
+# reboot needed.
+reset_vi() {
+	v4l2-ctl -d "$DEV" --set-ctrl bypass_mode=0,override_enable=0 >/dev/null 2>&1
+}
+
+recover_sensor() {
+	local drv=/sys/bus/i2c/drivers/ov5647 dev='' path
+	# the bound device is the one entry named <bus>-<addr>; the rest of
+	# the directory is the driver's own bind, unbind and uevent files
+	for path in "$drv"/[0-9]*-[0-9a-f]*; do
+		[ -e "$path" ] && { dev=${path##*/}; break; }
+	done
+	[ -n "$dev" ] || return 1
+	echo "$dev" > "$drv/unbind" 2>/dev/null || return 1
+	sleep 2
+	echo "$dev" > "$drv/bind" 2>/dev/null || return 1
+	sleep 3
+	[ -e "$DEV" ]
+}
+
+reset_vi
+v4l2-ctl -d "$DEV" --set-ctrl sensor_mode=$MODE >/dev/null 2>&1
+v4l2-ctl -d "$DEV" --set-fmt-video=width=$W,height=$H,pixelformat=BG10,bytesperline=$BPL >/dev/null 2>&1
+rm -f "$TMP/live.raw"
+timeout 30 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=3 \
+	--stream-to="$TMP/live.raw" >/dev/null 2>&1
+if [ ! -s "$TMP/live.raw" ]; then
+	echo "raw capture returns nothing after resetting the VI controls, rebinding the sensor driver"
+	recover_sensor || { echo "  rebinding failed"; exit 2; }
+	v4l2-ctl -d "$DEV" --set-ctrl sensor_mode=$MODE >/dev/null 2>&1
+	v4l2-ctl -d "$DEV" --set-fmt-video=width=$W,height=$H,pixelformat=BG10,bytesperline=$BPL >/dev/null 2>&1
+fi
+
+FB=$(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null | awk '/Size Image/{print $4}')
+[ -n "$FB" ] && [ "$FB" != 0 ] || { echo "cannot read the frame size from $DEV"; exit 2; }
+
+# Control writes go in 1.2 s after streamon, so every stream that takes
+# one must outlast that at the mode's own rate: two seconds, at least 40
+# frames.
+fps_ctrl() { # default or max
+	v4l2-ctl -d "$DEV" -l 2>/dev/null | awk -v k="$1=" '/frame_rate/ {
+		for (i = 1; i <= NF; i++) if (index($i, k) == 1) { sub(k, "", $i); print int($i / 1000000) } }'
+}
+FPS=$(fps_ctrl default)
+MAXFPS=$(fps_ctrl max)
+N=$(( ${FPS:-30} * 2 > 40 ? ${FPS:-30} * 2 : 40 ))
+
+mean_of_last() { # file
+	python3 - "$1" "$FB" "$H" <<-'PY'
+	import sys, numpy as np
+	path, fb, h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+	d = np.fromfile(path, dtype=np.uint16)
+	n = len(d) // (fb // 2)
+	if n == 0:
+	    print("-1 -1 -1")
+	    raise SystemExit
+	f = d[(n - 1) * fb // 2:n * fb // 2].reshape(h, -1).astype(np.float32)
+	print("%.1f %.1f %d" % (f.mean(), f.std(), f.max()))
+	PY
+}
+
+# Sets a control before streamon, then streams and returns the last frame.
+prestart() { # "ctrl=val,..." frames
+	rm -f "$TMP/p.raw"
+	v4l2-ctl -d "$DEV" --set-ctrl "$1" >/dev/null 2>&1
+	timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$2" \
+		--stream-to="$TMP/p.raw" >/dev/null 2>&1
+	mean_of_last "$TMP/p.raw"
+}
+
+# Streams, changes a control a moment in, and returns the last frame.
+probe() { # "ctrl=val,..." frames
+	rm -f "$TMP/p.raw"
+	timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$2" \
+		--stream-to="$TMP/p.raw" >/dev/null 2>&1 &
+	local pid=$!
+	sleep 1.2
+	v4l2-ctl -d "$DEV" --set-ctrl "$1" >/dev/null 2>&1
+	wait $pid 2>/dev/null
+	mean_of_last "$TMP/p.raw"
+}
+
+echo "== default frame rate"
+# A fresh stream with no frame_rate write runs at the frame length the
+# driver programs at stream start, which has to be the default the device
+# tree declares. The stored control is not applied here: override_enable
+# is 0. Two old versions of this driver passed every other check while
+# running this stream at 32.6 fps (the shortest frame of the mode) and at
+# 23.4 fps (no frame length written at all), against a declared 30.
+rm -f "$TMP/d.txt"; : > "$TMP/d.txt"
+stdbuf -o0 timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=600 \
+	> "$TMP/d.txt" 2>&1 &
+dpid=$!
+sleep 3
+a=$(tr -cd '<' < "$TMP/d.txt" | wc -c)
+sleep 5
+b=$(tr -cd '<' < "$TMP/d.txt" | wc -c)
+kill $dpid 2>/dev/null; wait $dpid 2>/dev/null
+got=$(python3 -c "print('%.2f' % (($b - $a) / 5.0))")
+# 5 %: the window resolves 0.2 fps and a correct driver measures within
+# 0.2 fps of the declared rate.
+if python3 -c "import sys; sys.exit(0 if abs($got - ${FPS:-30}) <= 0.05 * ${FPS:-30} else 1)"; then
+	echo "PASS default frame rate: ${FPS:-30} fps declared, measured $got"
+else
+	echo "FAIL default frame rate: ${FPS:-30} fps declared, measured $got"
+	fail=1
+fi
+
+echo "== frame rate"
+# One stream throughout: v4l2-ctl prints '<' per frame, so counting those
+# characters over a fixed window gives the rate the sensor really delivers.
+rm -f "$TMP/f.txt"; : > "$TMP/f.txt"
+# Park the control at the bottom of its range first. The framework skips a
+# write that does not change the stored value, so priming it at 30 would
+# make the first measurement below a no-op: the sensor would still be
+# running the mode table's own frame length, and the test would report
+# whatever that is as the rate it asked for.
+v4l2-ctl -d "$DEV" --set-ctrl frame_rate=2000000 >/dev/null 2>&1
+stdbuf -o0 timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=1200 \
+	> "$TMP/f.txt" 2>&1 &
+stream_pid=$!
+sleep 3
+for want in 30 15 5; do
+	if [ "$want" -gt "${MAXFPS:-30}" ]; then
+		echo "SKIP frame_rate $want fps: above this mode's ${MAXFPS} fps"
+		continue
+	fi
+	v4l2-ctl -d "$DEV" --set-ctrl frame_rate=$((want * 1000000)) >/dev/null 2>&1
+	sleep 1
+	a=$(tr -cd '<' < "$TMP/f.txt" | wc -c)
+	sleep 5
+	b=$(tr -cd '<' < "$TMP/f.txt" | wc -c)
+	got=$(python3 -c "print('%.2f' % (($b - $a) / 5.0))")
+	if python3 -c "import sys; sys.exit(0 if abs($got - $want) <= 0.15 * $want else 1)"; then
+		echo "PASS frame_rate $want fps: measured $got"
+	else
+		echo "FAIL frame_rate $want fps: measured $got"
+		fail=1
+	fi
+done
+kill $stream_pid 2>/dev/null; wait $stream_pid 2>/dev/null
+v4l2-ctl -d "$DEV" --set-ctrl frame_rate=30000000 >/dev/null 2>&1
+
+# Exposure and gain need light. Their effect is judged as a ratio against
+# the sensor black level. A covered lens is reported as inconclusive.
+#
+# The "too dark" test is relative to the black level. R32 hands over the 10-bit
+# sample right-aligned and R35 expands it to the full 16-bit range, so the
+# same scene reads about 64x higher on R35 and its black level sits near 960
+# (15 on R32). A fixed threshold in counts passes stray light through
+# as signal there and then fails the check it should have skipped.
+# A signal under half the black level is also too small to judge. At 0.9
+# counts, the exposure ratio of mode 3 on the Orin ranged from 1.7x to 26x
+# over four runs of the same scene.
+too_dark() { # lit black -> true when the difference is small
+	python3 -c "import sys; sys.exit(0 if $1 - $2 < 0.5 * $2 else 1)"
+}
+
+echo "== exposure"
+read -r dark _ _ <<<"$(probe "gain=16,exposure=93" "$N")"
+read -r lo _ _ <<<"$(probe "gain=16,exposure=2000" "$N")"
+read -r hi _ _ <<<"$(probe "gain=16,exposure=32000" "$N")"
+if too_dark "$hi" "$dark"; then
+	echo "SKIP exposure: the scene is too dark to tell (mean $dark to $hi)"
+else
+	rise=$(python3 -c "print('%.2f' % (($hi - $dark) / max($lo - $dark, 0.1)))")
+	# 2000 to 32000 us is 16x more light, so the signal above black must
+	# grow several times over unless it clips first.
+	if python3 -c "import sys; sys.exit(0 if $rise >= 3.0 else 1)"; then
+		echo "PASS exposure: signal above black grew ${rise}x from 2 ms to 32 ms"
+	else
+		echo "FAIL exposure: signal above black grew only ${rise}x from 2 ms to 32 ms"
+		fail=1
+	fi
+fi
+
+# The mode table loads its own exposure at streamon, and tegracam puts
+# the stored value back only while the VI override_enable control is on.
+# A value set before streaming has to survive that either way.
+echo "== exposure set before streamon"
+if too_dark "$hi" "$dark"; then
+	echo "SKIP exposure before streamon: the scene is too dark to tell"
+else
+	read -r plo _ _ <<<"$(prestart "gain=16,exposure=2000" 20)"
+	read -r phi _ _ <<<"$(prestart "gain=16,exposure=32000" 20)"
+	# Lost values leave both captures at the table's exposure, a ratio
+	# near 1.
+	rise=$(python3 -c "print('%.2f' % (($phi - $dark) / max($plo - $dark, 0.1)))")
+	if python3 -c "import sys; sys.exit(0 if $rise >= 3.0 else 1)"; then
+		echo "PASS exposure before streamon: signal above black grew ${rise}x from 2 ms to 32 ms"
+	else
+		echo "FAIL exposure before streamon: signal above black grew only ${rise}x from 2 ms to 32 ms"
+		fail=1
+	fi
+fi
+
+echo "== gain"
+read -r g1 _ _ <<<"$(probe "exposure=2000,gain=16" "$N")"
+read -r g2 _ _ <<<"$(probe "exposure=2000,gain=256" "$N")"
+if too_dark "$g2" "$dark"; then
+	echo "SKIP gain: the scene is too dark to tell"
+else
+	rise=$(python3 -c "print('%.2f' % (($g2 - $dark) / max($g1 - $dark, 0.1)))")
+	if python3 -c "import sys; sys.exit(0 if $rise >= 3.0 else 1)"; then
+		echo "PASS gain: signal above black grew ${rise}x from 1x to 16x"
+	else
+		echo "FAIL gain: signal above black grew only ${rise}x from 1x to 16x"
+		fail=1
+	fi
+fi
+
+# The sensor's own bar pattern is generated after the pixel array, so it
+# arrives whatever the lens sees. That makes it the one content check
+# that works on a dark bench, and it exercises the whole CSI and VI path.
+DBG=$(ls -d /sys/kernel/debug/ov5647-* 2>/dev/null | head -1)
+echo "== test pattern"
+if [ -z "$DBG" ]; then
+	echo "SKIP test pattern: no debugfs directory (CONFIG_DEBUG_FS off?)"
+else
+	rm -f "$TMP/t.raw"
+	timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$N" \
+		--stream-to="$TMP/t.raw" >/dev/null 2>&1 &
+	pid=$!
+	sleep 1.2
+	echo "0x503d 0x80" > "$DBG/reg" 2>/dev/null
+	wait $pid 2>/dev/null
+	bars=$(python3 - "$TMP/t.raw" "$FB" "$H" "$W" <<-'PY'
+	import sys, numpy as np
+	path, fb, h, w = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+	d = np.fromfile(path, dtype=np.uint16)
+	n = len(d) // (fb // 2)
+	if n == 0:
+	    print(0)
+	    raise SystemExit
+	f = d[(n - 1) * fb // 2:n * fb // 2].reshape(h, fb // h // 2)[:, :w]
+	row = f[h // 2].astype(int)
+	# eight equal bars, each a flat level: count how many distinct ones
+	mids = [int(np.median(row[int((i + 0.5) * w / 8) - 20:int((i + 0.5) * w / 8) + 20]))
+	        for i in range(8)]
+	print(len(set(mids)))
+	PY
+	)
+	# Turn the pattern back off. This needs its own stream: the register
+	# interface refuses writes once the sensor is powered down, so it
+	# cannot be done after the capture above has ended.
+	timeout 30 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$N" \
+		--stream-to=/dev/null >/dev/null 2>&1 &
+	pid=$!
+	sleep 1.2
+	echo "0x503d 0x00" > "$DBG/reg" 2>/dev/null
+	wait $pid 2>/dev/null
+
+	if [ "$bars" -ge 3 ]; then
+		echo "PASS test pattern: $bars distinct bar levels across the frame"
+	else
+		echo "FAIL test pattern: only $bars distinct levels, pattern did not reach the frame"
+		fail=1
+	fi
+fi
+
+# The sensor resets with its own white balance on, which scales red and
+# blue in the raw output and left captures of one scene disagreeing.
+echo "== sensor white balance"
+if [ -z "$DBG" ]; then
+	echo "SKIP sensor white balance: no debugfs directory"
+else
+	timeout 30 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$N" \
+		--stream-to=/dev/null >/dev/null 2>&1 &
+	pid=$!
+	sleep 1.5
+	echo 0x5001 > "$DBG/reg" 2>/dev/null
+	awb=$(awk '{print $2}' "$DBG/reg" 2>/dev/null)
+	wait $pid 2>/dev/null
+	if [ "$awb" = 0x00 ]; then
+		echo "PASS sensor white balance: off (0x5001 = $awb)"
+	else
+		echo "FAIL sensor white balance: 0x5001 = ${awb:-unreadable}, the sensor balances the raw output itself"
+		fail=1
+	fi
+fi
+
+# The module's identity comes out of the sensor's one-time programmable
+# memory, which is loaded once at probe. It has failed silently before, as
+# a buffer of zeroes, because the load needs the sensor's internal clock
+# and gets nothing while it sits in standby. The check therefore looks
+# for zeroes, the one failure that can be predicted.
+echo "== module identity"
+# v4l2-ctl prints a string control quoted: otp_data: 'e80cca...'
+otp=$(v4l2-ctl -d "$DEV" --get-ctrl otp_data 2>/dev/null |
+	sed "s/^otp_data: //; s/^'//; s/'$//")
+if [ -z "$otp" ]; then
+	echo "SKIP module identity: no otp_data control on this build"
+elif [ "$(printf '%s' "$otp" | grep -cE '^[0-9a-f]{64}$')" -eq 0 ]; then
+	echo "FAIL module identity: otp_data is '$otp', not 64 hex digits"
+	fail=1
+elif [ "$(printf '%s' "$otp" | grep -cE '^0{64}$')" -gt 0 ]; then
+	echo "FAIL module identity: OTP read back as all zeroes, the load did not run"
+	fail=1
+else
+	echo "PASS module identity: $otp"
+fi
+
+[ "$fail" = 0 ] && echo "ALL CONTROL CHECKS PASSED" || echo "SOME CONTROL CHECKS FAILED"
+exit $fail

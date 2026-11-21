@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026 Artur Andrzejczak <andrzejczak.artur@gmail.com>
+# Capture check for the OV5647 driver. Run ON the board, after installing.
+#
+#   sudo tests/capture-check.sh            # all modes, raw and ISP
+#   sudo tests/capture-check.sh --raw-only # skip the Argus checks
+#
+# The raw captures run at gain 1x and EXPOSURE microseconds (default
+# 10000). The driver starts at its shortest exposure. Without a setting
+# the frame is almost black in any scene.
+#
+# Each raw mode is checked three ways, because a frame count alone proves
+# very little: v4l2-ctl keeps streaming in the previous format when a
+# requested one is rejected, and a covered lens still delivers full frame
+# counts. So the script also confirms the device accepted the geometry it
+# was asked for, that the file holds exactly the expected number of bytes,
+# that the pixels carry signal above a flat black level, and that odd
+# lines are not cut short by an unaligned stride.
+set -uo pipefail
+
+DEV=${DEV:-/dev/video0}
+FRAMES=${FRAMES:-10}
+EXPOSURE=${EXPOSURE:-10000}
+RAW_ONLY=""
+[ "${1:-}" = "--raw-only" ] && RAW_ONLY=1
+
+command -v v4l2-ctl >/dev/null || { echo "need v4l2-utils"; exit 2; }
+command -v python3 >/dev/null || { echo "need python3"; exit 2; }
+[ -e "$DEV" ] || { echo "no $DEV: is the driver loaded and the overlay applied?"; exit 2; }
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+fail=0
+
+# The sensor is Bayer BGGR, which V4L2 spells BG10. RG10 is a different
+# order and the driver does not advertise it; asking for it leaves the
+# format untouched and the capture silently runs in whatever was set last.
+FMT=BG10
+
+# VI on R35 and JetPack 7 reports a stride of width x 2 bytes but writes
+# each line at a 64-byte boundary. Ask for an aligned stride.
+stride() { # width
+	echo $(( ($1 * 2 + 63) / 64 * 64 ))
+}
+
+check_raw() { # mode width height
+	local mode=$1 w=$2 h=$3 name="mode$1 ${2}x${3}"
+
+	v4l2-ctl -d "$DEV" --set-ctrl sensor_mode="$mode" >/dev/null 2>&1
+	v4l2-ctl -d "$DEV" --set-ctrl gain=16,exposure="$EXPOSURE" >/dev/null 2>&1
+	local err
+	if ! err=$(v4l2-ctl -d "$DEV" --set-fmt-video=width="$w",height="$h",pixelformat=$FMT,bytesperline="$(stride "$w")" 2>&1); then
+		if [ "$(printf '%s' "$err" | grep -ci busy)" -gt 0 ]; then
+			# fuser lists nothing for another user's process unless we are
+			# root, so a busy device can look like it has no owner at all.
+			echo "FAIL $name: $DEV is busy, another process still has it open" \
+			     "(run as root to see which: fuser -v $DEV)"
+		else
+			echo "FAIL $name: device rejected the format: $(echo "$err" | head -1)"
+		fi
+		fail=1; return
+	fi
+
+	local got size
+	got=$(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null | awk '/Width\/Height/{print $3}')
+	size=$(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null | awk '/Size Image/{print $4}')
+	if [ "$got" != "$w/$h" ]; then
+		echo "FAIL $name: device is at $got, not the requested geometry"; fail=1; return
+	fi
+
+	rm -f "$TMP/raw"
+	timeout 60 v4l2-ctl -d "$DEV" --stream-mmap --stream-count="$FRAMES" \
+		--stream-to="$TMP/raw" >/dev/null 2>&1
+	local bytes expected
+	bytes=$(stat -c %s "$TMP/raw" 2>/dev/null || echo 0)
+	expected=$((size * FRAMES))
+	if [ "$bytes" = 0 ]; then
+		local h
+		h=$(holders)
+		if [ -n "$h" ]; then
+			echo "FAIL $name: no data, $DEV is held by pid(s) $h:"
+			ps -o pid=,user=,args= -p $h 2>/dev/null | sed 's/^/    /'
+		else
+			echo "FAIL $name: streaming returned no data and nothing else holds $DEV"
+		fi
+		fail=1; return
+	fi
+	if [ "$bytes" != "$expected" ]; then
+		echo "FAIL $name: captured $bytes B, expected $expected B"; fail=1; return
+	fi
+
+	# Content: a frame that is all black level has almost no spread. This
+	# catches a covered lens or a dead link, which frame counting misses.
+	# The tail of the second line catches a stride the VI cannot honour:
+	# it starts each line at a 64-byte boundary, so with an unaligned
+	# stride every second line begins early and ends in zeroes.
+	# R35 and JetPack 7 scale the samples to 16 bits. Dividing by 64 gives
+	# the 10-bit numbers that R32 delivers, so one threshold fits all.
+	local stats mean std max tail
+	stats=$(python3 - "$TMP/raw" "$size" "$h" "$w" <<-'PY'
+	import sys, numpy as np
+	path, size, h, w = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+	d = np.fromfile(path, dtype=np.uint16)
+	frames = len(d) // (size // 2)
+	f = d[(frames - 1) * size // 2:frames * size // 2].reshape(h, -1)[:, :w].astype(np.float32)
+	tail = f[1::2, -16:].max()
+	if f.max() > 1023:
+	    f /= 64
+	print("%.1f %.1f %d %d" % (f.mean(), f.std(), f.max(), tail))
+	PY
+	)
+	read -r mean std max tail <<<"$stats"
+	if [ "$tail" = 0 ]; then
+		echo "FAIL $name: odd lines end in zeroes, the line stride is not 64-byte aligned"
+		fail=1; return
+	fi
+	local verdict="ok"
+	if python3 -c "import sys; sys.exit(0 if float('$std') < 2.0 else 1)"; then
+		verdict="ok, but the frame is flat (std $std): lens covered or no light?"
+	fi
+	echo "PASS $name: $FRAMES frames, $bytes B, mean $mean std $std max $max, $verdict"
+}
+
+# The frame rate has to be in the caps. Left out, nvarguscamerasrc asks for
+# its default 30 fps, which the 15 fps full-resolution mode cannot deliver, and
+# Argus refuses the stream. Only R32 names the cause, as "Frame Rate specified
+# is greater than supported"; R35 reports NvBufSurfaceFromFd failing instead,
+# which suggests a buffer problem and hides the cause.
+# The check counts the buffers that arrive. A search of the log for error
+# words misses some failures.
+# A missing plugin makes gst-launch say "erroneous pipeline", which holds
+# no "error" and no "fail", so a word search called that a pass and
+# reported five working ISP modes on a board with no Argus plugin at all.
+check_argus() { # mode width height fps
+	local mode=$1 w=$2 h=$3 fps=$4 out rc got
+	out=$(timeout 60 gst-launch-1.0 -v nvarguscamerasrc sensor-mode="$mode" num-buffers=10 \
+		! "video/x-raw(memory:NVMM),width=$w,height=$h,framerate=$fps/1" \
+		! fakesink silent=false 2>&1)
+	rc=$?
+	got=$(printf '%s' "$out" | grep -c 'chain.*fakesink')
+	if [ "$rc" != 0 ] || [ "$got" -lt 10 ]; then
+		echo "FAIL argus mode$mode ${w}x${h}@$fps: $got/10 frames, gst exited $rc"
+		printf '%s' "$out" | grep -iE 'error|erroneous|fail|not-negotiated' | head -1 | sed 's/^/    /'
+		fail=1
+	else
+		echo "PASS argus mode$mode ${w}x${h}@$fps: $got frames"
+	fi
+}
+
+# A capture that produces nothing almost always means that something else
+# still has the device open. The hardware rarely needs a reboot. The usual
+# sources are Argus, which keeps the sensor open after a pipeline ends, and
+# a capture whose kill hit the `timeout` wrapper and left v4l2-ctl
+# streaming under init. An orphan started under
+# sudo also survives an unprivileged pkill without reporting an error.
+holders() { # names whatever still has the device open
+	fuser "$DEV" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
+}
+free_device() {
+	pkill -9 v4l2-ctl 2>/dev/null
+	pkill -9 gst-launch-1.0 2>/dev/null
+	systemctl stop nvargus-daemon 2>/dev/null
+	sleep 2
+	local h
+	h=$(holders)
+	[ -z "$h" ] && return 0
+	echo "$DEV is still held by pid(s) $h after cleanup:"
+	ps -o pid=,user=,args= -p $h 2>/dev/null | sed 's/^/  /'
+	echo "run this script as root, or kill those first"
+	return 1
+}
+
+free_device || exit 2
+
+# An Argus pipeline leaves the VI controls bypass_mode and override_enable
+# at 1. With bypass_mode at 1 the raw V4L2 path returns no frames. The
+# sensor keeps streaming (0x0100 still reads 1 and the mode registers are
+# unchanged), and the kernel logs __vb2_queue_cancel warnings about
+# buffers the VI channel never returned. Setting both controls back to 0
+# is enough on R32. Rebinding the sensor driver rebuilds the channel and
+# clears the state too. That remedy was tested on R35, so it stays as the
+# fallback.
+reset_vi() {
+	v4l2-ctl -d "$DEV" --set-ctrl bypass_mode=0,override_enable=0 >/dev/null 2>&1
+}
+
+recover_sensor() {
+	local drv=/sys/bus/i2c/drivers/ov5647 dev='' path
+	# the bound device is the one entry named <bus>-<addr>; the rest of
+	# the directory is the driver's own bind, unbind and uevent files
+	for path in "$drv"/[0-9]*-[0-9a-f]*; do
+		[ -e "$path" ] && { dev=${path##*/}; break; }
+	done
+	[ -n "$dev" ] || return 1
+	echo "$dev" > "$drv/unbind" 2>/dev/null || return 1
+	sleep 2
+	echo "$dev" > "$drv/bind" 2>/dev/null || return 1
+	sleep 3
+	[ -e "$DEV" ]
+}
+
+raw_alive() {
+	rm -f "$TMP/live.raw"
+	timeout 30 v4l2-ctl -d "$DEV" --stream-mmap --stream-count=3 \
+		--stream-to="$TMP/live.raw" >/dev/null 2>&1
+	[ -s "$TMP/live.raw" ]
+}
+
+reset_vi
+if ! raw_alive; then
+	echo "raw capture returns nothing after resetting the VI controls,"
+	echo "rebinding the sensor driver"
+	if recover_sensor && raw_alive; then
+		echo "  recovered"
+	else
+		echo "  still no data after rebinding: this is not the Argus case"
+		exit 2
+	fi
+fi
+
+check_raw 0 2592 1944
+check_raw 1 1920 1080
+check_raw 2 1296 972
+check_raw 4 1280 720
+# Last: a failed capture in this mode once left the Orin's capture path stuck
+# until the board lost power, which fails every mode after it.
+check_raw 3 640 480
+
+if [ -z "$RAW_ONLY" ] && command -v gst-launch-1.0 >/dev/null; then
+	systemctl start nvargus-daemon 2>/dev/null
+	sleep 2
+	check_argus 0 2592 1944 15
+	check_argus 1 1920 1080 30
+	check_argus 2 1296 972 30
+	check_argus 3 640 480 90
+	check_argus 4 1280 720 60
+	# Leave the board usable. The raw path stays empty until the VI
+	# controls are back at 0.
+	systemctl stop nvargus-daemon 2>/dev/null
+	if reset_vi; then
+		echo "note: VI controls reset to 0 for the raw path"
+	else
+		echo "note: could not reset the VI controls, raw capture may need a rebind of the sensor driver"
+	fi
+fi
+
+[ "$fail" = 0 ] && echo "ALL CHECKS PASSED" || echo "SOME CHECKS FAILED"
+exit $fail
